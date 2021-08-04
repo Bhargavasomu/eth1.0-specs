@@ -73,6 +73,7 @@ num
 utils
 prepend
 runtime
+pathlib
 
 sha3
 
@@ -106,6 +107,7 @@ sar
 
 keccak256
 
+alloc
 address
 balance
 origin
