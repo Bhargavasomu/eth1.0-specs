@@ -142,12 +142,23 @@ class Receipt:
 State = Dict[Address, Account]
 
 
+def initialize_account(state: State, address: Address):
+    state[address] = Account(
+        nonce=Uint(0),
+        balance=U256(0),
+        code=bytearray(),
+        storage={},
+    )
+
+
 def modify_state(
     state: State, address: Address, f: Callable[[Account], None]
 ) -> None:
     """
     Modify an `Account` in the `State`.
     """
+    if address not in state:
+        initialize_account(state, address)
     state[address] = modify(state[address], f)
 
 
@@ -170,3 +181,10 @@ def move_ether(
 
     modify_state(state, sender_address, reduce_sender_balance)
     modify_state(state, recipient_address, increase_recipient_balance)
+
+
+def add_ether(state: State, address: Address, amount: U256) -> None:
+    def increase_balance(account: Account) -> None:
+        account.balance += amount
+
+    modify_state(state, address, increase_balance)

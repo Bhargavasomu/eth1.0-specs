@@ -32,6 +32,7 @@ memoization
 merkle
 merkleize
 metaclass
+ommer
 ommers
 patricialize
 rlp

@@ -9,3 +9,7 @@ line_length = 79
 
 [tool.black]
 line-length = 79
+
+[tool.check-manifest]
+ignore = ["tests/*", "setup.cfg", ".git/*", ".github/*", "blocksDB/*", ".tox/*", ".mypy_cache/*", ".pytest_cache/*"]
+

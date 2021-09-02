@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import List, Tuple
 
 from ethereum.frontier.bloom import logs_bloom
+from ethereum.genesis import MAINNET_GENESIS_CONFIG
 
 from .. import crypto
 from ..base_types import U256, Uint
@@ -36,6 +37,7 @@ from .eth_types import (
     Root,
     State,
     Transaction,
+    add_ether,
     modify_state,
     move_ether,
 )
@@ -43,7 +45,7 @@ from .vm.interpreter import process_call
 
 BLOCK_REWARD = U256(5 * 10 ** 18)
 GAS_LIMIT_ADJUSTMENT_FACTOR = 1024
-GAS_LIMIT_MINIMUM = 125000
+GAS_LIMIT_MINIMUM = 5000
 GENESIS_DIFFICULTY = Uint(131072)
 
 
@@ -111,8 +113,24 @@ def state_transition(chain: BlockChain, block: Block) -> None:
     block :
         Block to apply to `chain`.
     """
-    parent_header = get_block_header_by_hash(block.header.parent_hash, chain)
-    validate_header(block.header, parent_header)
+    # if block.header.number == 0:
+    #     # TODO: Validate the genesis block
+    #     chain.blocks.append(block)
+    #     return
+
+    # if block.header.number == 0:
+    #     validate_genesis_block(block)
+    # else:
+    #     parent_header = get_block_header_by_hash(block.header.parent_hash, chain)
+    #     validate_header(block.header, parent_header)
+
+    if block.header.number == 0:
+        validate_genesis_header(block.header)
+        apply_prealloc(chain.state, MAINNET_GENESIS_CONFIG.alloc)
+    else:
+        parent_header = get_block_header_by_hash(block.header.parent_hash, chain)
+        validate_header(block.header, parent_header)
+
     (
         gas_used,
         transactions_root,
@@ -132,9 +150,9 @@ def state_transition(chain: BlockChain, block: Block) -> None:
     )
 
     assert gas_used == block.header.gas_used
-    assert compute_ommers_hash(block) == block.header.ommers_hash
-    # TODO: Also need to verify that these ommers are indeed valid as per the
-    # Nth generation
+    validate_ommers(
+        block.ommers, block.header.ommers_hash, block.header.number, chain
+    )
     assert transactions_root == block.header.transactions_root
     assert receipt_root == block.header.receipt_root
     assert trie.root(trie.map_keys(state)) == block.header.state_root
@@ -163,10 +181,58 @@ def validate_header(header: Header, parent_header: Header) -> None:
         parent_header.timestamp,
         parent_header.difficulty,
     )
+
+    # TODO: Check why all the blocks have the same gas limit as 5k instead of 125k
     assert check_gas_limit(header.gas_limit, parent_header.gas_limit)
     assert header.timestamp > parent_header.timestamp
     assert header.number == parent_header.number + 1
     assert len(header.extra_data) <= 32
+
+
+def validate_genesis_header(genesis_header: Header):
+    assert genesis_header.parent_hash == b'\x00' * 32
+    assert genesis_header.coinbase == b'\x00' * 20
+    assert genesis_header.difficulty == MAINNET_GENESIS_CONFIG.difficulty
+    assert genesis_header.number == 0
+    assert genesis_header.gas_limit == MAINNET_GENESIS_CONFIG.gas_limit
+    assert genesis_header.gas_used == 0
+    assert genesis_header.timestamp == MAINNET_GENESIS_CONFIG.timestamp
+    assert genesis_header.extra_data == MAINNET_GENESIS_CONFIG.extra_data
+    assert genesis_header.mix_digest == b'\x00' * 32
+    assert genesis_header.nonce == MAINNET_GENESIS_CONFIG.nonce
+
+
+def apply_prealloc(state, alloc_data):
+    for address, account in alloc_data.items():
+        assert len(account.keys()) == 1
+        add_ether(state, address, account['balance'])
+
+
+
+# GENESIS_BLOCK = Block(
+#     header=Header(
+#         parent_hash=(b'\x00' * 32),
+#         ommers_hash=crypto.keccak256(rlp.encode([])),
+#         coinbase=(b'\x00' * 20),
+#         state_root='?'
+#         transactions_root='?',
+#         receipt_root='?',
+#         bloom=(b'\x00' * 256),
+#         difficulty=GENESIS_DIFFICULTY,
+#         number=Uint(0),
+#         gas_limit='?',
+#         gas_used=Uint(0),
+#         timestamp='?',
+#         extra_data='?',
+#         mix_digest=(b'\x00' * 32),
+#         nonce='?',
+#     ),
+#     transactions=[],
+#     ommers=[],
+# )
+
+
+ZERO_ADDRESS = b'\x00' * 20
 
 
 def apply_body(
@@ -224,9 +290,6 @@ def apply_body(
     receipts = []
     block_logs = ()
 
-    if coinbase not in state:
-        state[coinbase] = EMPTY_ACCOUNT
-
     for tx in transactions:
         assert tx.gas <= gas_available
         sender_address = recover_sender(tx)
@@ -256,10 +319,8 @@ def apply_body(
             )
         )
 
-    def pay_block_reward(coinbase: Account) -> None:
-        coinbase.balance += BLOCK_REWARD
-
-    modify_state(state, coinbase, pay_block_reward)
+    if block_number != 0:
+        pay_rewards(state, block_number, coinbase, ommers)
 
     gas_remaining = block_gas_limit - gas_available
 
@@ -285,6 +346,38 @@ def apply_body(
         block_logs_bloom,
         state,
     )
+
+
+def validate_ommers(ommers, expected_ommers_hash, block_number, chain) -> None:
+    assert len(ommers) <= 2
+    assert crypto.keccak256(rlp.encode(ommers)) == expected_ommers_hash
+    for ommer in ommers:
+        # Ommer age with respect to the current block. For example, an age of
+        # 1 indicates that the ommer is a sibling of previous block.
+        ommer_age = block_number - ommer.number
+        assert 1 <= ommer_age <= 6
+        # Canonical equivalent block for the ommer block
+        equivalent_canonical_block = chain.blocks[len(chain.blocks) - ommer_age]
+        # TODO: We get the hash along with the block, need to store it
+        # somewhere instead of computing it every time.
+        ommer_hash = crypto.keccak256(rlp.encode(ommer))
+        assert ommer_hash != crypto.keccak256(
+            rlp.encode(equivalent_canonical_block.header)
+        )
+        assert (
+            ommer.parent_hash == equivalent_canonical_block.header.parent_hash
+        )
+
+
+def pay_rewards(state, block_number, coinbase, ommers) -> None:
+    miner_reward = BLOCK_REWARD + ((BLOCK_REWARD * len(ommers)) // 32)
+    add_ether(state, coinbase, miner_reward)
+
+    for ommer in ommers:
+        # Ommer age with respect to the current block.
+        ommer_age = block_number - ommer.number
+        ommer_miner_reward = BLOCK_REWARD - ((BLOCK_REWARD * ommer_age) // 8)
+        add_ether(state, ommer.coinbase, ommer_miner_reward)
 
 
 def compute_ommers_hash(block: Block) -> Hash32:
@@ -314,12 +407,9 @@ def process_transaction(
     logs : `Tuple[eth1spec.eth_types.Log, ...]`
         Logs generated during execution.
     """
-    assert validate_transaction(tx)
+    assert validate_transaction(tx, env)
 
     sender = env.origin
-
-    assert env.state[sender].nonce == tx.nonce
-    assert env.state[sender].balance >= tx.gas * tx.gas_price
 
     gas = tx.gas - calculate_intrinsic_cost(tx)
 
@@ -341,7 +431,7 @@ def process_transaction(
     return (gas_used, logs)
 
 
-def validate_transaction(tx: Transaction) -> bool:
+def validate_transaction(tx: Transaction, env: vm.Environment) -> bool:
     """
     Verifies a transaction.
 
@@ -349,13 +439,22 @@ def validate_transaction(tx: Transaction) -> bool:
     ----------
     tx :
         Transaction to validate.
+    env :
+        Environment for the Ethereum Virtual Machine.
 
     Returns
     -------
     verified : `bool`
         True if the transaction can be executed, or False otherwise.
     """
-    return calculate_intrinsic_cost(tx) <= tx.gas
+    sender = env.origin
+
+    return (
+        # TODO: What if the sender is not yet present in the state
+        env.state[sender].nonce == tx.nonce
+        and calculate_intrinsic_cost(tx) <= tx.gas
+        and env.state[sender].balance >= tx.gas * tx.gas_price
+    )
 
 
 def calculate_intrinsic_cost(tx: Transaction) -> Uint:
@@ -408,10 +507,11 @@ def recover_sender(tx: Transaction) -> Address:
     )
 
     assert v == 27 or v == 28
-    assert 0 < r and r < secp256k1n
+    assert 0 < r < secp256k1n
+    assert 0 < s < secp256k1n
 
     # TODO: this causes error starting in block 46169 (or 46170?)
-    # assert 0<s_int and s_int<(secp256k1n//2+1)
+    # assert 0 < s_int and s_int < (secp256k1n//2+1)
 
     public_key = crypto.secp256k1_recover(r, s, v - 27, signing_hash(tx))
     return Address(crypto.keccak256(public_key)[12:32])
